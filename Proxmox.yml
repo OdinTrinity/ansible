@@ -1,0 +1,104 @@
+---
+# Rolling update of Proxmox VE nodes, one node at a time.
+# Reboot is OFF by default: run with reboot_if_needed=true to allow it.
+- name: Rolling update of Proxmox VE nodes
+  hosts: proxmox
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: true
+
+  vars:
+    reboot_if_needed: false
+    # Never auto-reboot these nodes (e.g. the node running the Semaphore VM,
+    # because rebooting it kills this very job). Reboot them by hand.
+    no_reboot_hosts:
+      - pve1
+
+  tasks:
+    - name: Check cluster status
+      ansible.builtin.command: pvecm status
+      register: pvecm
+      changed_when: false
+      failed_when: false
+
+    - name: Stop if the cluster is not quorate
+      ansible.builtin.assert:
+        that: pvecm.stdout is search('Quorate:\s+Yes')
+        fail_msg: "Cluster is not quorate on {{ inventory_hostname }} - aborting."
+      when: pvecm.rc == 0
+
+    - name: Refresh package lists
+      ansible.builtin.apt:
+        update_cache: true
+      register: apt_update
+
+    - name: List upgradable packages
+      ansible.builtin.command: apt list --upgradable
+      register: upgradable
+      changed_when: false
+
+    - name: Show upgradable packages
+      ansible.builtin.debug:
+        msg: "{{ upgradable.stdout_lines | reject('match', '^Listing') | list }}"
+
+    # Proxmox must be upgraded with dist-upgrade (full-upgrade), never plain upgrade.
+    # force-confold keeps your existing config files (no prompts, no overwritten configs).
+    - name: Full upgrade (dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: false
+        dpkg_options: "force-confdef,force-confold"
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: apt_upgrade
+
+    - name: Find newest installed Proxmox kernel
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -1 /boot/vmlinuz-*-pve 2>/dev/null | sed 's#/boot/vmlinuz-##' | sort -V | tail -n1
+      args:
+        executable: /bin/bash
+      register: newest_kernel
+      changed_when: false
+
+    - name: Decide whether a reboot is needed
+      ansible.builtin.set_fact:
+        reboot_needed: "{{ newest_kernel.stdout | length > 0 and newest_kernel.stdout != ansible_kernel }}"
+
+    - name: Report reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: running {{ ansible_kernel }}, newest {{ newest_kernel.stdout }}.
+          Reboot needed: {{ reboot_needed }}.
+          {% if reboot_needed and inventory_hostname in no_reboot_hosts %}Excluded from auto-reboot - reboot it manually.{% endif %}
+
+    - name: Reboot node
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        msg: "Rebooting after Proxmox update (Ansible/Semaphore)"
+      when:
+        - reboot_if_needed | bool
+        - reboot_needed | bool
+        - inventory_hostname not in no_reboot_hosts
+
+    - name: Wait for the node to rejoin a quorate cluster
+      ansible.builtin.command: pvecm status
+      register: pvecm_after
+      changed_when: false
+      until: pvecm_after.stdout is search('Quorate:\s+Yes')
+      retries: 30
+      delay: 10
+      when:
+        - pvecm.rc == 0
+        - reboot_if_needed | bool
+        - reboot_needed | bool
+        - inventory_hostname not in no_reboot_hosts
+
+    - name: Show running version
+      ansible.builtin.command: pveversion
+      register: pveversion
+      changed_when: false
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "{{ pveversion.stdout }}"
